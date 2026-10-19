@@ -1,4 +1,4 @@
-# Linking SHELDUS_panelstudies
+# Linking SHELDUS and longitudinal studies
 This repository provides code to link SHELDUS data with longitudinal studies such as cohort or panel studies. The code was originally developed for use with the [Health and Retirement Study (HRS)](https://hrs.isr.umich.edu/). However, HRS respondent location below the county level is restricted-level information (it is not publicly disclosable whether a state even has residents included in the HRS sample). Therefore, for this example, I simulate data for a hypothetical longitudinal study of residents of South Carolina which has publicly available data in SHELDUS and that I used in another [code example](https://github.com/jennatipaldo/sheldus_sc). The format and variables of the simulated data are intended to emulate the HRS and other longitudinal datasets. 
 
 ## Data Source
