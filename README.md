@@ -27,4 +27,4 @@ Hazards & Perils:	All
 
 Loss Types:	Fatalities, Injuries, Property Losses
 
-Aggregate By:	Month, Hazard, County, Year
+Aggregate By:	[none] 
