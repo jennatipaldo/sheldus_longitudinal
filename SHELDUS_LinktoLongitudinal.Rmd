@@ -1,0 +1,507 @@
+---
+title: "SHELDUS merge"
+author: "Jenna Tipaldo"
+date: "2026-10-18"
+output: html_document
+---
+
+#Load packages
+```{r setup, echo=F}
+library(tidyverse)
+library(haven)
+library(beepr)
+library(data.table)
+library(here) #set WD as folder where the file is (not technically necessary for an .Rmd file but helpful for an R script)
+```
+
+#Read in and clean SHELDUS
+I used the following settings in my query:
+
+Search By: Location and Dates
+Adjustment Year: 2022
+States: SOUTH CAROLINA
+Counties: All
+Date Range: 2012-01-01 to 2021-12-31
+Hazards & Perils: All
+Loss Types: Fatalities, Injuries, Property Losses
+Aggregate By: [none] (this is to get the Raw records)
+```{r}
+sheldus <- read_csv("direct_loss_raw_output.csv")
+
+colnames(sheldus)
+```
+
+##Summarize rows within county with the same start and end date
+```{r}
+gc()
+
+sheldus_clean <- sheldus%>%
+  #head(1000)%>% #to test
+  group_by(County_FIPS, StartDate, EndDate)%>%
+  summarize(Hazard=paste(unique(Hazard), collapse = ";"),
+            Month = mean(Month),
+            Quarter = mean(Quarter),
+            Year = mean(Year),
+            Duration_Days = mean(Duration_Days),
+            Fatalities= sum(Fatalities),
+            FatalitiesPerCapita = sum(FatalitiesPerCapita),
+            Injuries=sum(Injuries),
+            InjuriesPerCapita=sum(InjuriesPerCapita),
+            CropDmg=sum(CropDmg),
+            CropDmgAdj=sum(`CropDmg(ADJ)`),
+            CropDmgPerCapita=sum(CropDmgPerCapita),
+            PropertyDmg=sum(PropertyDmg),
+            PropertyDmgAdj=sum(`PropertyDmg(ADJ)`),
+            PropertyDmgPerCapita=sum(PropertyDmgPerCapita),
+            n=n()
+              )%>%
+  ungroup()
+
+table(sheldus_clean$Injuries>0)
+
+beep() #beeps when chunk is done running
+```
+
+## add column for each hazard 
+dummy variable 
+```{r}
+table(sheldus$Hazard)
+
+# Define the list of hazard types
+hazard_types <- c(
+  "Avalanche", "Coastal", "Drought", "Earthquake", "Flood", 
+  "Fog", "Hail", "Heat", "Hurricane/Tropical Storm", "Landslide", 
+  "Lightning", "Severe Storm/Thunder Storm", "Tornado", "Tsunami/Seiche", 
+  "Volcano", "Wildfire", "Wind", "Winter Weather"
+)
+
+# Create dummy variables for each hazard type
+# Using grepl to check if each hazard type appears in the Hazard column
+for (hazard in hazard_types) {
+  # Create column name (replace spaces and slashes with underscores)
+  col_name <- paste0("hazard_", gsub("[/ ]", "_", tolower(hazard)))
+  
+  # Create dummy variable (1 if hazard present, 0 if not)
+  sheldus_clean[[col_name]] <- as.integer(grepl(hazard, sheldus_clean$Hazard, ignore.case = TRUE))
+}
+
+beep() #beeps when chunk is done running
+# View the first few rows with new columns
+head(sheldus_clean)
+colnames(sheldus_clean)
+```
+
+
+##prep SHELDUS for join using data.table
+Duplicate the start date variable, since that is what will be used for the join using the data.table package
+```{r}
+sheldus_clean<-sheldus_clean%>%
+  mutate(StartDate2 = StartDate, #to be able to identify max/min when also using it as a filtering criteria in data.table join
+         )
+```
+
+# Simulate analytic file (by participant-wave file)
+AI Disclaimer: data simulation code developed using Claude
+```{r}
+set.seed(2026)
+
+# ---- Settings ---------------------------------------------------------------
+n_resp   <- 1000                                   #number of respondents in sample
+n_waves  <- 5                                     #number of waves
+p_died   <- 0.60                                  # share of those lost-to-followup who died
+p_couple<-0.30
+haz      <- c(NA, runif(n_waves - 1, 0.03, 0.08)) # wave-specific attrition (5-10%)
+
+# South Carolina county FIPS - pull from SHELDUS and sample to include some counties 
+sc_fips    <- sample(unique(sheldus$County_FIPS), size=30) 
+
+# ---- Respondent-level frame (70 households: 30 couples + 40 singles) --------
+hh <- tibble(
+  HHID   = sprintf("%06d", sample(100000:999999, n_resp*.70)),
+  n_pn   = c(rep(2, n_resp*p_couple), rep(1, n_resp*.40)),
+  County_base = sample(sc_fips, n_resp - n_resp*p_couple, replace = TRUE) # all 30 used
+)
+
+resp <- hh |>
+  uncount(n_pn) |>
+  group_by(HHID) |>
+  mutate(PN = sprintf("%03d", 9 + row_number())) |>   # 010, 011
+  ungroup()
+
+stopifnot(nrow(resp) == n_resp)
+
+# ---- Simulate attrition (monotone: once lost, stays lost) -------------------
+last_wave <- function() {
+  last <- 1
+  for (w in 2:n_waves) {
+    if (runif(1) < haz[w]) break
+    last <- w
+  }
+  last
+}
+
+resp <- resp |>
+  mutate(
+    last_wave = map_int(seq_len(n()), \(i) last_wave()),
+    attrited  = last_wave < n_waves,
+    dead      = attrited & (rbinom(n(), 1, p_died) == 1)
+  )
+
+# ---- Simulate moves: 10% of respondents move counties exactly once ----------
+# Movers are drawn from respondents observed beyond Wave 1, and the move wave
+# is the first wave at which the new county is observed (so the move is
+# actually visible in the data).
+n_movers  <- round(0.10 * n_resp)
+mover_idx <- sample(which(resp$last_wave >= 2), n_movers)
+
+resp$move_wave <- NA_integer_
+resp$move_wave[mover_idx] <-
+  map_int(resp$last_wave[mover_idx], \(l) 1L + sample.int(l - 1, 1))
+
+resp$County_new <- NA_integer_
+resp$County_new[mover_idx] <-
+  map_int(resp$County_base[mover_idx], \(c) sample(setdiff(sc_fips, c), 1))
+
+# ---- Expand to long format --------------------------------------------------
+dat <- resp |>
+  crossing(Wave = 1:n_waves) |>
+  arrange(HHID, PN, Wave) |>
+  mutate(
+    Year = 2012 + 2 * (Wave - 1),
+    inw = as.integer(Wave <= last_wave),
+    died = as.integer(dead & inw == 0),
+    County = if_else(!is.na(move_wave) & Wave >= move_wave,
+                     County_new, County_base),
+    Interview_date = if_else(
+      inw == 1,
+      as.Date(paste0(Year, "-01-01")) + sample(0:364, n(), replace = TRUE),
+      as.Date(NA)
+    )
+  ) |>
+  select(HHID, PN, Wave, Year, Interview_date, County, inw, died)
+
+# ---- Checks -----------------------------------------------------------------
+dat |> count(Wave, inw) |> pivot_wider(names_from = inw, values_from = n)
+
+dat |>
+  group_by(Wave) |>
+  summarise(n_in = sum(inw), .groups = "drop") |>
+  mutate(pct_lost = round(100 * (1 - n_in / lag(n_in)), 1))
+
+# share of attriters (by respondent) who died
+resp |> filter(attrited) |> summarise(pct_died = mean(dead))
+
+n_distinct(dat$County)
+
+# movers: share of respondents whose county changes, and number of changes each
+dat |>
+  group_by(HHID, PN) |>
+  summarise(n_moves = sum(County != lag(County), na.rm = TRUE), .groups = "drop") |>
+  count(n_moves) |>
+  mutate(pct = n / sum(n))
+head(dat, 12)
+
+analyticfile_county<-dat 
+```
+
+#Lag interview date and county to indicate mover waves
+```{r}
+#First create a variable "county_lag_same" that indicates whether a respondent moved
+analyticfile_county<-analyticfile_county%>%
+  group_by(HHID,PN)%>% #group by person
+  arrange(Wave)%>% #arrange waves in temporal order
+  mutate(Interview_date_lag = lag(Interview_date),
+         Interview_date_midpt = if_else(!is.na(Interview_date_lag), Interview_date_lag + (Interview_date - Interview_date_lag) / 2, NA),
+         County_lag = lag(County),
+         county_lag_same = if_else(County ==lag(County),1,0), #check if current county is same as previous
+         )%>% 
+  ungroup()
+
+#assess this variable
+##Check: the number of NA should be equal to the number of respondents since it corresponds to the first wave of observation (no prior observed location to be lagged). In practice, this could change if respondents have missing locations in their first wave or location history prior to first wave of observation (ideal!).
+table(analyticfile_county$county_lag_same, useNA = "always")
+
+analyticfile_county<-analyticfile_county%>%
+  mutate(mover = if_else(county_lag_same==1,0,1),
+         exposurelinktype = case_when(
+                      Wave==1  & inw==1 ~ 1, #first wave (if don't know location pre-recruitment)
+                      county_lag_same==T & inw==1 ~ 2, #nonmover waves
+                      county_lag_same==F & inw==1 ~ 3, #mover waves
+                      county_lag_same==T & inw==0 & died==1 ~ 4, #death nonmover waves
+                      county_lag_same==F & inw==0 & died==1 ~ 5, #death mover waves
+                      ),
+         wave_losttofollowup = if_else(inw==0 & died==1, 1, NA), #loss to follow up 
+         Interview_date_2yr = Interview_date-730, #2 yrs prior
+         Interview_date_2yrafter = Interview_date+730 #2 yrs prior
+         )
+
+#Check: Table of exposure link type
+##NOTE: in this simulated data there are no "death mover" waves but this can happen: a respondent may move between their last interview and their death and this move is captured in their exit interview
+table(analyticfile_county$exposurelinktype, useNA = "always")
+
+table(analyticfile_county$wave_losttofollowup, useNA = "always")
+```
+
+# Link Disaster Data to participants
+
+##Optional: filter SHELDUS to only counties in longitudinal dataset
+```{r}
+counties <- unique(analyticfile_county$County)
+
+sheldus_clean_filtered <- sheldus_clean%>%
+  #head(10000)%>%
+  filter(County_FIPS %in% counties)
+
+#check that all counties in sample show up in SHELDUS
+SHELDUScounties <- unique(sheldus_clean_filtered$County_FIPS)
+
+analyticfile_county<- analyticfile_county%>%
+  mutate(countyinSHELDUS = if_else(County %in% SHELDUScounties,1,0),
+         countyinFEMA = if_else(County %in% SHELDUScounties,1,0))
+
+table(is.na(analyticfile_county$County))
+#NAs come from participants who had no location in any wave and will be excluded, not relevant for simulared data 
+
+table(analyticfile_county$countyinSHELDUS)
+```
+
+
+#Join
+##data.table approach for speed
+
+```{r}
+colnames(analyticfile_county)
+sheldus_dt <- as.data.table(sheldus_clean_filtered)
+analytic_dt <- as.data.table(analyticfile_county) # %>%head(1000) #to test
+analytic_firstwave <-analytic_dt[exposurelinktype==1] 
+analytic_alivenonmovers <-analytic_dt[exposurelinktype==2] 
+analytic_alivemovers <-analytic_dt[exposurelinktype==3]
+analytic_deadnonmovers <-analytic_dt[exposurelinktype==4] 
+analytic_deadmovers <-analytic_dt[exposurelinktype==5]
+analytic_LTF <-analytic_dt[wave_losttofollowup==1]
+```
+
+#SHELDUS for each data.table for each exposure link type
+for each file, 
+specify begin date of interval - all: prev interview date (lag)
+specify end date of interval - alive: interview date, dead: death date (if relevant)
+
+The (debatable) assumption made here is that for people who moved in between interview observations, they moved at the midpoint of their previous and current interview dates.
+
+```{r, warning=F}
+gc() #clear working memory before running
+
+#first wave
+result_firstwave<- sheldus_dt[analytic_firstwave, 
+                    .(HHID=HHID,
+                      PN=PN,
+                      Wave=Wave,
+                      exposurelinktype=exposurelinktype,
+                      Interview_date=Interview_date,
+                      Interview_date_lag=Interview_date_lag,
+                      count=.N,
+                      count_hurricane = sum(hazard_hurricane_tropical_storm==1, na.rm = T),
+                      count_tornado = sum(hazard_tornado==1, na.rm = T),
+                      count_wildfire = sum(hazard_wildfire==1, na.rm = T),
+                      count_flood = sum(hazard_flood==1 & hazard_hurricane_tropical_storm==0, na.rm = T),
+                      count_winter = sum(hazard_winter_weather==1, na.rm = T),
+                      count_propdamage1mil = sum(PropertyDmg>1000000, na.rm = T),
+                      count_propdamage10pc = sum(PropertyDmgPerCapita>=10, na.rm = T),
+                      count_propdamage50pc = sum(PropertyDmgPerCapita>=50, na.rm = T),
+                      date_earliestdisaster = min(StartDate2, na.rm = T),
+                      date_earliestdisaster_prop50pc = min(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster_prop50pc = max(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster = max(StartDate2, na.rm = T)
+                      ),
+                    on= .(County_FIPS ==County,
+                          StartDate>=Interview_date_2yr, #two years prior
+                          StartDate<Interview_date #start date falls in window
+                          #ensures events are only counted once, based on start date
+                          ),
+                    by= .EACHI
+                    ]
+
+result_firstwave<-result_firstwave%>%
+  select(-starts_with("StartDate"))
+
+#Alive non movers
+result_alivenonmovers<- sheldus_dt[analytic_alivenonmovers, 
+                    .(HHID=HHID,
+                      PN=PN,
+                      Wave=Wave,
+                      exposurelinktype=exposurelinktype,
+                      Interview_date=Interview_date,
+                      Interview_date_lag=Interview_date_lag,
+                      count=.N,
+                      count_hurricane = sum(hazard_hurricane_tropical_storm==1, na.rm = T),
+                      count_tornado = sum(hazard_tornado==1, na.rm = T),
+                      count_wildfire = sum(hazard_wildfire==1, na.rm = T),
+                      count_flood = sum(hazard_flood==1 & hazard_hurricane_tropical_storm==0, na.rm = T),
+                      count_winter = sum(hazard_winter_weather==1, na.rm = T),
+                      count_propdamage1mil = sum(PropertyDmg>1000000, na.rm = T),
+                      count_propdamage10pc = sum(PropertyDmgPerCapita>=10, na.rm = T),
+                      count_propdamage50pc = sum(PropertyDmgPerCapita>=50, na.rm = T),
+                      date_earliestdisaster = min(StartDate2, na.rm = T),
+                      date_earliestdisaster_prop50pc = min(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster_prop50pc = max(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster = max(StartDate2, na.rm = T)
+                      ),
+                    on= .(County_FIPS ==County,
+                          StartDate>=Interview_date_lag, #two years prior
+                          StartDate<Interview_date #start date falls in window
+                          #ensures events are only counted once, based on start date
+                          ),
+                    by= .EACHI
+                    ]
+
+result_alivenonmovers<-result_alivenonmovers%>%
+  select(-starts_with("StartDate"))
+
+#quick checks
+table(is.na(result_alivenonmovers$Interview_date_lag))
+table(result_alivenonmovers$count>0)
+table(result_alivenonmovers$count_propdamage50pc>0)
+table(result_alivenonmovers$date_earliestdisaster_prop50pc)
+
+#Alive movers
+#half time for previous county
+result_alivemovers_firsthalf<- sheldus_dt[analytic_alivemovers, 
+                    .(HHID=HHID,
+                      PN=PN,
+                      Wave=Wave,
+                      exposurelinktype=exposurelinktype,
+                      Interview_date=Interview_date,
+                      Interview_date_lag=Interview_date_lag,
+                      count=.N,
+                      count_hurricane = sum(hazard_hurricane_tropical_storm==1, na.rm = T),
+                      count_tornado = sum(hazard_tornado==1, na.rm = T),
+                      count_wildfire = sum(hazard_wildfire==1, na.rm = T),
+                      count_flood = sum(hazard_flood==1 & hazard_hurricane_tropical_storm==0, na.rm = T),
+                      count_winter = sum(hazard_winter_weather==1, na.rm = T),
+                      count_propdamage1mil = sum(PropertyDmg>1000000, na.rm = T),
+                      count_propdamage10pc = sum(PropertyDmgPerCapita>=10, na.rm = T),
+                      count_propdamage50pc = sum(PropertyDmgPerCapita>=50, na.rm = T),
+                      date_earliestdisaster = min(StartDate2, na.rm = T),
+                      date_earliestdisaster_prop50pc = min(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster_prop50pc = max(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster = max(StartDate2, na.rm = T)
+                      ),
+                    on= .(
+                      County_FIPS == County_lag,
+                          StartDate>=Interview_date_lag ,
+                          StartDate<Interview_date_midpt #start date falls in window
+                          #ensures events are only counted once, based on start date
+                          ),
+                    by= .EACHI
+                    ]
+#half time for current county
+result_alivemovers_secondhalf<- sheldus_dt[analytic_alivemovers, 
+                    .(HHID=HHID,
+                      PN=PN,
+                      Wave=Wave,
+                      exposurelinktype=exposurelinktype,
+                      Interview_date=Interview_date,
+                      Interview_date_lag=Interview_date_lag,
+                      count=.N,
+                      count_hurricane = sum(hazard_hurricane_tropical_storm==1, na.rm = T),
+                      count_tornado = sum(hazard_tornado==1, na.rm = T),
+                      count_wildfire = sum(hazard_wildfire==1, na.rm = T),
+                      count_flood = sum(hazard_flood==1 & hazard_hurricane_tropical_storm==0, na.rm = T),
+                      count_winter = sum(hazard_winter_weather==1, na.rm = T),
+                      count_propdamage1mil = sum(PropertyDmg>1000000, na.rm = T),
+                      count_propdamage10pc = sum(PropertyDmgPerCapita>=10, na.rm = T),
+                      count_propdamage50pc = sum(PropertyDmgPerCapita>=50, na.rm = T),
+                      date_earliestdisaster = min(StartDate2, na.rm = T),
+                      date_earliestdisaster_prop50pc = min(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster_prop50pc = max(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+                      date_latestdisaster = max(StartDate2, na.rm = T)
+                      ),
+                    on= .(County_FIPS == County_lag,
+                          StartDate>=Interview_date_midpt,
+                          StartDate<Interview_date  #start date falls in window
+                          #ensures events are only counted once, based on start date
+                          ),
+                    by= .EACHI
+                    ]
+
+#combine them
+result_alivemovers<-rbindlist(list(result_alivemovers_firsthalf, result_alivemovers_secondhalf))
+
+result_alivemovers<-result_alivemovers%>%
+  select(-starts_with("StartDate"))%>%
+  group_by(HHID, PN, Wave,Interview_date,Interview_date_lag,exposurelinktype)%>%
+  summarize(n=n(),
+            count = sum(count),
+            count_propdamage1mil = sum(count_propdamage1mil),
+            count_propdamage10pc = sum(count_propdamage10pc),
+            count_propdamage50pc = sum(count_propdamage50pc),
+            date_earliestdisaster = min(date_earliestdisaster,na.rm=T),
+            date_earliestdisaster_prop50pc = min(date_earliestdisaster_prop50pc, na.rm = T),
+            date_latestdisaster_prop50pc = max(date_latestdisaster_prop50pc, na.rm = T),
+            date_latestdisaster = max(date_latestdisaster,na.rm=T)
+            )%>%
+  ungroup()
+
+
+##Dead - when a death date is available can do the same as above for alive respondents
+# result_deadnonmovers<- sheldus_dt[analytic_deadnonmovers, 
+#                     .(HHID=HHID,
+#                       PN=PN,
+#                       Wave=Wave,
+#                       exposurelinktype=exposurelinktype,
+#                       Interview_date=Interview_date,
+#                       Interview_date_lag=Interview_date_lag,
+#                       count=.N,
+#                       count_hurricane = sum(hazard_hurricane_tropical_storm==1, na.rm = T),
+#                       count_tornado = sum(hazard_tornado==1, na.rm = T),
+#                       count_wildfire = sum(hazard_wildfire==1, na.rm = T),
+#                       count_flood = sum(hazard_flood==1 & hazard_hurricane_tropical_storm==0, na.rm = T),
+#                       count_winter = sum(hazard_winter_weather==1, na.rm = T),
+#                       count_propdamage1mil = sum(PropertyDmg>1000000, na.rm = T),
+#                       count_propdamage10pc = sum(PropertyDmgPerCapita>=10, na.rm = T),
+#                       count_propdamage50pc = sum(PropertyDmgPerCapita>=50, na.rm = T),
+#                       date_earliestdisaster = min(StartDate2, na.rm = T),
+#                       date_earliestdisaster_prop50pc = min(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+#                       date_latestdisaster_prop50pc = max(StartDate2[PropertyDmgPerCapita>=50], na.rm = T),
+#                       date_latestdisaster = max(StartDate2, na.rm = T)
+#                       ),
+#                     on= .(County_FIPS ==County,
+#                           StartDate>=Interview_date_lag,
+#                           StartDate<dateofdeath_exact
+#                           ),
+#                     by= .EACHI
+#                     ]
+
+
+
+result<-rbindlist(list(result_firstwave,result_alivemovers, result_alivenonmovers), use.names = T, fill=T)
+beep()
+
+
+#check
+#rows in the final result = rows in the original file - first waves - (death waves and waves missing exposurelinktype)
+nrow(result) == nrow(analytic_dt) - sum(analyticfile_county$exposurelinktype%in%c(4,5),is.na(analyticfile_county$exposurelinktype)) 
+
+
+#replace all -Inf and Inf in date columns with NA
+result[sapply(result, is.infinite)] <- NA
+
+beep() #beeps when chunk is done running
+```
+
+
+# Create a participant level file
+```{r}
+#participant level file
+byhhidpn_sheldus <- result%>%
+  group_by(HHID,PN)%>%
+  #filter(exposurelinktype!=1)%>%
+  summarize(sheldus_evercount = sum(count),
+            sheldus_evercountpropdamage50pc = sum(count_propdamage50pc),
+            sheldus_evercountpropdamage1mil = sum(count_propdamage1mil),
+            sheldus_earliestdisaster = min(date_earliestdisaster, na.rm=T)
+            )
+
+head(byhhidpn_sheldus)
+```
+
